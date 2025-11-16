@@ -48,6 +48,15 @@ function formatTs(ts: number | null) {
   }
 }
 
+function formatUptime(ms: number | null) {
+  if (ms === null || ms === undefined) return "";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  return `${m}m ${remS}s`;
+}
+
 export default function Dashboard() {
   const [mqttConnected, setMqttConnected] = useState(false);
   const [sensorData, setSensorData] = useState<SensorState>({
@@ -58,6 +67,9 @@ export default function Dashboard() {
     relay: null,
   });
   const [lastUpdatedMs, setLastUpdatedMs] = useState<number | null>(null);
+
+  // New: store device-reported uptime (ms) when device sends a small ts value
+  const [deviceUptimeMs, setDeviceUptimeMs] = useState<number | null>(null);
 
   useEffect(() => {
     const client = mqtt.connect(MQTT_URL, {
@@ -85,6 +97,7 @@ export default function Dashboard() {
     client.on("message", (_topic, message) => {
       try {
         const payload = JSON.parse(message.toString());
+
         const next: SensorState = {
           temperature:
             typeof payload.temp === "number"
@@ -120,22 +133,46 @@ export default function Dashboard() {
 
         setSensorData((s) => ({ ...s, ...next }));
 
-        // normalize ts to milliseconds
+        // Normalize/interpret payload.ts robustly
+        // Cases:
+        //  - epoch ms (e.g. 1690000000000)  -> use as-is
+        //  - epoch seconds (e.g. 1690000000) -> *1000
+        //  - small number (e.g. 40000) -> device uptime in ms; approximate event time = arrival
         let tsMs: number | null = null;
+        let deviceUptime: number | null = null;
         if (payload.ts !== undefined && payload.ts !== null) {
           const raw = Number(payload.ts);
-          // heuristics:
-          // - if raw looks like epoch seconds (<= 10^11), multiply by 1000
-          // - if already ms (> 10^11), use as-is
           if (!isNaN(raw)) {
-            tsMs = raw > 1e11 ? raw : raw * 1000;
+            if (raw > 1e12) {
+              // already milliseconds epoch
+              tsMs = raw;
+            } else if (raw > 1e9) {
+              // seconds epoch -> convert to ms
+              tsMs = raw * 1000;
+            } else if (raw >= 0) {
+              // small number -> treat as device uptime (ms)
+              deviceUptime = raw;
+              // we can't reconstruct exact historic epoch reliably,
+              // so use arrival time as the event time (best-effort).
+              tsMs = Date.now();
+            }
           }
         } else {
-          // if no ts, use arrival time
           tsMs = Date.now();
         }
 
-        if (tsMs) setLastUpdatedMs(tsMs);
+        // set device uptime if we detected one (useful in UI)
+        if (deviceUptime !== null) {
+          setDeviceUptimeMs(deviceUptime);
+        } else {
+          // clear previous uptime value if payload provided absolute ts
+          setDeviceUptimeMs(null);
+        }
+
+        // Use arrival time as fallback if tsMs couldn't be computed
+        if (!tsMs) tsMs = Date.now();
+
+        setLastUpdatedMs(tsMs);
       } catch (e) {
         console.error("Invalid MQTT payload:", e);
       }
@@ -265,6 +302,7 @@ export default function Dashboard() {
                       <div>Last update (device ts)</div>
                       <div className="text-xs text-slate-500">
                         {lastUpdatedMs ? formatTs(lastUpdatedMs) : "--"}
+                        {deviceUptimeMs ? ` (uptime ${formatUptime(deviceUptimeMs)})` : ""}
                       </div>
                     </li>
                   </ul>
@@ -306,6 +344,7 @@ export default function Dashboard() {
                     <span className="font-medium">
                       {lastUpdatedMs ? formatTs(lastUpdatedMs) : "--"}
                     </span>
+                    {deviceUptimeMs ? ` • uptime ${formatUptime(deviceUptimeMs)}` : ""}
                   </div>
                 </div>
               </CardContent>
@@ -314,10 +353,6 @@ export default function Dashboard() {
         </main>
 
         <Separator className="my-6" />
-
-        <footer className="text-xs text-slate-500 text-center">
-          Simple, responsive dashboard built with shadcn components.
-        </footer>
       </div>
     </div>
   );
